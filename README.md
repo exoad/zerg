@@ -98,6 +98,10 @@ Final consensus output is posted as embeds and includes session debug details:
 - Providers can repeat across agents.
 - If model discovery is insufficient, configured agent defaults are used as fallback.
 
+## License
+
+This project is released under the [Good Faith License (GFL) v1.0](LICENSE). A significant portion was created with AI assistance, and this license closes the loop — giving back to the open-source commons what the models took from it. Do whatever you want with it, just keep the spirit of reciprocity alive.
+
 ## Reply attribution format
 
 - If an agent responds to a specific message ID, output is prefixed with a directional label:
