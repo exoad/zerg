@@ -3,12 +3,20 @@ from __future__ import annotations
 from typing import Any
 
 from src.core.agents import AgentConfig
+from src.core.discussion_mode import infer_discussion_mode, infer_objective_tier
 from src.core.session import DebateEvent, DebateSnapshot, EventType
 from src.core.stance_tracking import (
     build_recent_positions,
     detect_unresolved_conflicts,
     get_last_speaker_snapshot,
 )
+
+
+def _safe_intensity(value: str, default: str) -> str:
+    cleaned = (value or "").strip().lower()
+    if cleaned in {"low", "medium", "high"}:
+        return cleaned
+    return default
 
 
 def _event_type_label(event: DebateEvent) -> str:
@@ -31,22 +39,15 @@ def _event_to_block(event: DebateEvent) -> str:
     actor = event.actor_name or "Unknown"
 
     content = event.content.replace("\n", " ").strip()
-    if len(content) > 240:
-        content = content[:237].rstrip() + "..."
+    if len(content) > 400:
+        content = content[:397].rstrip() + "..."
 
     msg_id = event.metadata.get("discord_message_id")
-    reply_to_id = event.metadata.get("reply_to_message_id")
-    reply_to_actor = event.metadata.get("reply_to_actor_name")
-    reply_to = "none"
-    if reply_to_id:
-        target = str(reply_to_actor or "unknown")
-        reply_to = f"{target}#{reply_to_id}"
-
     msg_text = str(msg_id) if msg_id else "n/a"
     return (
         f"[EVENT] type={label} turn={event.turn_index} epoch={event.epoch}\n"
         f"speaker={actor}\n"
-        f"message_id={msg_text} reply_to={reply_to}\n"
+        f"message_id={msg_text}\n"
         f"content={content}"
     )
 
@@ -109,6 +110,18 @@ def _trim_events(events: list[DebateEvent], max_events: int, max_chars: int) -> 
             return merged
 
 
+def _mode_word_band(settings: Any, mode: str, objective_tier: str) -> tuple[int, int]:
+    if mode == "objective":
+        if objective_tier == "simple":
+            return settings.objective_simple_min_words, settings.objective_simple_max_words
+        return settings.objective_min_words, settings.objective_max_words
+    if mode == "exploratory":
+        return settings.debatable_min_words, settings.debatable_max_words
+    if mode == "adversarial":
+        return settings.adversarial_min_words, settings.adversarial_max_words
+    return settings.debatable_min_words, settings.debatable_max_words
+
+
 def build_agent_messages(
     snapshot: DebateSnapshot,
     agent: AgentConfig,
@@ -134,11 +147,79 @@ def build_agent_messages(
         f"{starter_name} started this conversation. "
         f"Talk like you're in a casual group chat with people you already know — no formal greetings, no stiff language. "
         f"Respond naturally on the spot. Don't overthink, over-prepare, or write like you're drafting a document. "
+        f"Use common sense. If a question is obviously simple, treat it as simple. Don't manufacture complexity where none exists. "
         f"If someone asks a simple question, answer it simply. Don't turn a straightforward topic into a formal debate or philosophical discussion. "
-        f"Keep your messages to a reasonable length — think email-length, not essay-length. When a few sentences are enough, stop there. "
+        f"If someone has already given a correct, straightforward answer to a simple question, just pass. Don't feel obligated to add your own take, restate the answer, or add caveats on something that's already settled. "
+        f"Don't start messages with 'Actually' or 'I think' — these are filler phrases that add nothing. "
+        f"Keep your messages to a reasonable length — think a few short paragraphs at most. This is a quick messaging platform, not a forum or email thread. When a few sentences are enough, stop there. "
         f"When the topic genuinely needs more depth, go deeper, but be mindful of not dumping walls of text into the chat. "
         f"Reference {starter_name} naturally when it makes sense, but don't force their name into every message.\n"
     )
+
+    from src.config.settings import get_settings
+
+    settings = get_settings()
+    discussion_mode = infer_discussion_mode(
+        topic=topic,
+        events=selected_events,
+        auto_enabled=settings.discussion_mode_auto,
+        default_mode=settings.default_discussion_mode,
+    )
+    objective_tier = infer_objective_tier(topic=topic, events=selected_events)
+    min_words, max_words = _mode_word_band(settings, discussion_mode, objective_tier)
+    attack_intensity = _safe_intensity(settings.attack_intensity, "high")
+    taunt_intensity = _safe_intensity(settings.taunt_intensity, "medium")
+    profanity_rule = (
+        "Profanity is allowed if used strategically and sparingly."
+        if settings.allow_profanity
+        else "Avoid profanity. Keep attacks sharp without explicit swearing."
+    )
+    is_instigator = "instigator" in agent.name.lower()
+    instigator_rule = (
+        "Instigator override: lean into emotional heat. Prefer sharp, confrontational language and regularly use profanity when attacking weak claims. "
+        "Do not be polite by default; escalate pressure unless the conversation is already collapsing."
+        if is_instigator
+        else ""
+    )
+    enforced_taunt_rule = (
+        "Global enforcement: every speaking turn should include at least one blunt callout against another participant. "
+        "Profanity is strongly encouraged when attacking weak arguments, but keep it natural to the flow of chat. "
+        "Do not soften your language. Break down weak arguments aggressively and personally."
+        if settings.enforce_taunt_profanity and discussion_mode == "adversarial"
+        else ""
+    )
+
+    if discussion_mode == "objective":
+        objective_profanity_note = (
+            "Profanity is discouraged in this mode unless you are sharply correcting a major error."
+            if settings.objective_profanity_policy == "discourage"
+            else "Keep profanity minimal in this mode."
+        )
+        mode_rule = (
+            "Discussion mode: objective. Prioritize factual accuracy, clear explanation, and plausibility. "
+            "Do NOT force a debate on settled facts. Only challenge others when they are factually incorrect, misleading, or incomplete. "
+            + objective_profanity_note
+        )
+        if objective_tier == "simple":
+            mode_rule += (
+                " This appears to be a simple objective question with a likely single correct answer. "
+                "If another agent already gave the correct answer, prefer pass unless you are correcting an actual mistake."
+            )
+    elif discussion_mode == "exploratory":
+        mode_rule = (
+            "Discussion mode: exploratory. Give a distinctive, first-person interpretation with vivid but plausible detail. "
+            "Do not turn this into artificial combat. You may disagree, but prioritize meaningful self-description and nuance. "
+            "Add one concrete contrast with another model/agent style when relevant."
+        )
+    elif discussion_mode == "adversarial":
+        mode_rule = (
+            "Discussion mode: adversarial. Prioritize direct clashes, aggressive rebuttals, and pressure-testing weak claims. "
+            "Challenge by name and keep the tone combative and human."
+        )
+    else:
+        mode_rule = (
+            "Discussion mode: debatable. Be assertive and challenge weak takes, but stay grounded and avoid empty hostility."
+        )
 
     system_prompt = (
         f"{agent.system_prompt}\n\n"
@@ -149,20 +230,38 @@ def build_agent_messages(
         "Stay focused on the topic, but don't treat it like a formal debate.\n"
         "All messages above are visible to everyone.\n"
         "If someone sends a follow-up message labeled HUMAN_STEER, that's direct guidance — prioritize it.\n"
-        "CRITICAL: When responding to a specific point someone made, ALWAYS set reply_to_message_id to their message_id from the transcript. Don't just mention their name — use the reply feature.\n"
-        "Don't send empty acknowledgments like 'I agree' or 'no additional points' — use action 'pass' instead.\n"
+        "To reply to a specific message, set quote_message_id to that message's message_id from the transcript. "
+        "The system will automatically prepend a formatted quote before your message.\n"
+        "Conversation style should follow the active discussion mode.\n"
+        f"{mode_rule}\n"
+        f"Attack intensity: {attack_intensity}. Taunt intensity: {taunt_intensity}. {profanity_rule}\n"
+        f"{enforced_taunt_rule}\n"
+        f"{instigator_rule}\n"
+        "CRITICAL: State your own position directly in your FIRST sentence. Don't begin with agreement, hedging, or a clarifying question.\n"
+        "If you ask a question, you must also include your own provisional answer in the same message.\n"
+        "Use this compact structure: claim -> counterattack -> reason/evidence -> implication.\n"
+        "You should challenge at least one specific agent's point in most turns when the topic is debatable/adversarial. Don't only expand the original prompt.\n"
+        "Address other participants by name when attacking their position.\n"
+        "Write like a real Discord user, not a formal essay: contractions, slang, and natural phrasing are good.\n"
+        "Avoid sterile template language like 'I strongly disagree', 'one concrete reason is', 'furthermore', or 'in conclusion'.\n"
+        "Do not sound like a model-generated memo. Keep it blunt, specific, and human.\n"
+        "Keep paragraphing chat-native: 1-3 short paragraphs, no corporate tone, no lecture voice.\n"
+        "Read and react to what others already said. Do not repeat someone else's phrasing or conclusion unless you add a new attack angle.\n"
+        f"Target message length for speak: {min_words}-{max_words} words.\n"
+        "Avoid repetition: don't just restate or endorse another agent's point unless you add new reasoning.\n"
+        "If someone has already given a correct, straightforward answer to a simple question, just pass. Don't feel obligated to add your own take, restate the answer, or add caveats on something that's already settled. "
+        "Don't start messages with 'Actually' or 'I think' — these are filler phrases that add nothing. "
         "Respond naturally on the spot — don't overthink, over-prepare, or write like you're drafting a document. Talk like you're typing in a group chat.\n"
-        "Keep your messages to a reasonable length — think email-length, not essay-length. When a few sentences are enough, stop there. When the topic genuinely needs more, go deeper, but don't dump walls of text into the chat.\n"
+        "Keep your messages to a reasonable length — think a few short paragraphs at most. This is a quick messaging platform, not a forum or email thread. When a few sentences are enough, stop there. When the topic genuinely needs more, go deeper, but don't dump walls of text into the chat.\n"
         "You can send multiple messages in sequence by returning multiple JSON objects, one after another. Each represents one separate message.\n"
         "Example of multiple messages:\n"
-        '{"action": "speak", "message": "First point here", "reply_to_message_id": "123"}\n'
-        '{"action": "speak", "message": "Also, second point"}\n'
-        "Don't include message IDs, debug info, JSON field names, or 'Reply to X' text in your actual message. The reply_to_message_id field handles threading.\n"
-        "Return strict JSON only with keys: action, message, and optionally reply_to_message_id.\n"
+        '{"action": "speak", "message": "First point here"}\n'
+        '{"action": "speak", "message": "Also, second point", "quote_message_id": "123"}\n'
+        "Return strict JSON only with keys: action, message, and optionally quote_message_id.\n"
         "- action must be either speak or pass\n"
         "- if action is pass, you have nothing new to add\n"
         "- if action is speak, message should be natural chat text\n"
-        "- (Optional) reply_to_message_id: the message_id you are replying to (must be a numeric string)\n"
+        "- (Optional) quote_message_id: the message_id you are replying to (must be a numeric string)\n"
         "Tools (web_search, execute_python, execute_javascript) are available but only use them when they genuinely help.\n"
         "IMPORTANT: Your response must be ONLY the JSON object(s). No other text, explanations, or system information.\n"
     )
@@ -171,6 +270,8 @@ def build_agent_messages(
         f"Session ID: {snapshot.session_id}\n"
         f"Current Turn: {snapshot.turn_index}\n"
         f"Current Epoch: {snapshot.epoch}\n\n"
+        f"Discussion Mode: {discussion_mode}\n\n"
+        f"Objective Tier: {objective_tier}\n\n"
         f"Topic: {topic}\n\n"
         "Last speaker snapshot:\n"
         f"{last_speaker_text}\n\n"

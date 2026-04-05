@@ -8,7 +8,7 @@ from discord.ext import commands
 
 from src.app.webhooks import WebhookManager
 from src.config.settings import Settings
-from src.core.orchestrator import CouncilOrchestrator, SessionRoster
+from src.core.orchestrator import MIN_SESSION_TURNS, CouncilOrchestrator, SessionRoster
 from src.llm.model_catalog import ModelCatalog
 
 
@@ -103,7 +103,7 @@ def wire_bot(
             return
 
         try:
-            await orchestrator.start_session(
+            session = await orchestrator.start_session(
                 channel_id=channel_id,
                 starter_user_id=interaction.user.id,
                 starter_name=interaction.user.display_name,
@@ -123,10 +123,18 @@ def wire_bot(
             )
             return
 
+        requested_turns = max_turns if max_turns is not None else settings.council_max_turns
+        start_desc = (
+            "Send follow-up messages in this channel to steer the agents in real time.\n"
+            f"Max turns this session: {session.max_turns}"
+        )
+        if requested_turns < MIN_SESSION_TURNS:
+            start_desc += f"\nRequested max turns ({requested_turns}) was clamped to minimum {MIN_SESSION_TURNS}."
+
         embeds: list[discord.Embed] = [
             _zerg_embed(
                 "Council Started",
-                "Send follow-up messages in this channel to steer the agents in real time.",
+                start_desc,
                 color=discord.Color.green(),
             )
         ]

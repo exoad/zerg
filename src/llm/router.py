@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,7 +29,7 @@ class AgentDecision:
     provider: str
     model: str
     attempts_used: int
-    reply_to_message_id: str | None = None
+    quote_message_id: str | None = None
     tools_used: dict[str, int] = field(default_factory=dict)
     tool_results: str | None = None
     multi_messages: list["AgentDecision"] = field(default_factory=list)
@@ -127,6 +128,10 @@ class LLMRouter:
                     )
                 raise
         logger.info('Agent %s using model "%s" provider "%s" produced output: "%s"', agent.name, actual_model, actual_provider, result.text.replace('"','\'"\''))
+        recent_contents, recent_speakers = self._extract_recent_agent_context(messages)
+        discussion_mode = self._extract_discussion_mode(messages)
+        objective_tier = self._extract_objective_tier(messages)
+        is_instigator = "instigator" in agent.name.lower()
         dec = self._parse_decision(
             result.text,
             latency_ms=result.latency_ms,
@@ -134,6 +139,143 @@ class LLMRouter:
             model=actual_model,
             attempts_used=result.attempts_used,
         )
+
+        if discussion_mode == "objective" and objective_tier == "simple" and dec.action == "speak":
+            correction_count = self._objective_correction_count(recent_contents)
+            is_correction = self._is_correction_message(dec.message)
+            if is_correction and correction_count >= self.settings.objective_simple_max_corrections:
+                dec = AgentDecision(
+                    action="pass",
+                    message="pass",
+                    raw_text=dec.raw_text,
+                    latency_ms=dec.latency_ms,
+                    provider=dec.provider,
+                    model=dec.model,
+                    attempts_used=dec.attempts_used,
+                    quote_message_id=dec.quote_message_id,
+                )
+            elif (not is_correction) and self._is_redundant_objective_answer(dec.message, recent_contents):
+                dec = AgentDecision(
+                    action="pass",
+                    message="pass",
+                    raw_text=dec.raw_text,
+                    latency_ms=dec.latency_ms,
+                    provider=dec.provider,
+                    model=dec.model,
+                    attempts_used=dec.attempts_used,
+                    quote_message_id=dec.quote_message_id,
+                )
+
+        needs_rewrite, rewrite_reason = self._needs_rewrite(
+            dec,
+            recent_contents,
+            recent_speakers,
+            discussion_mode=discussion_mode,
+            objective_tier=objective_tier,
+            is_instigator=is_instigator,
+        )
+        if (
+            self.settings.stance_retry_enabled
+            and dec.action == "speak"
+            and needs_rewrite
+        ):
+            logger.info("Rewriting first draft for %s due to: %s", agent.name, rewrite_reason)
+            rewrite_messages = [
+                *messages,
+                {"role": "assistant", "content": result.text},
+                {
+                    "role": "user",
+                    "content": (
+                        "Rewrite your last answer with a direct stance-first response. "
+                        f"Issue to fix: {rewrite_reason}. "
+                        f"Current discussion mode: {discussion_mode}. "
+                        f"Current objective tier: {objective_tier}. "
+                        "Write like an actual Discord user, not a formal assistant. "
+                        "Rules: (1) first sentence must state your position, "
+                        + (
+                            "(2) include at least one concrete reason and one pointed challenge to another agent's claim, "
+                            if discussion_mode != "objective"
+                            else "(2) include at least one concrete factual reason; only challenge another agent if they are factually wrong, "
+                        )
+                        + "(3) if you ask a question, include your own provisional answer, "
+                        + f"(4) target {self._word_bounds_for_mode(discussion_mode, objective_tier)[0]}-{self._word_bounds_for_mode(discussion_mode, objective_tier)[1]} words, "
+                        + "(5) do not paraphrase previous messages. Add new attack angle/evidence. "
+                        + (
+                            "(6) include at least one direct taunt by name and at least one profanity term. "
+                            if self.settings.enforce_taunt_profanity and discussion_mode == "adversarial"
+                            else ""
+                        )
+                        + (
+                            "(7) for your instigator role, prefer emotionally aggressive language and frequent profanity when it sharpens your attack. "
+                            if is_instigator
+                            else ""
+                        )
+                        + "(8) avoid robotic templates like 'I strongly disagree', 'one concrete reason is', 'furthermore', 'in conclusion'. "
+                        "Return strict JSON only with action/message and optional quote_message_id."
+                    ),
+                },
+            ]
+            try:
+                rewrite = await self._complete_with_retries(
+                    provider=actual_provider,
+                    model=actual_model,
+                    messages=rewrite_messages,
+                    timeout_sec=timeout_sec,
+                    max_tokens=self.settings.agent_response_max_tokens,
+                )
+                logger.info(
+                    'Agent %s rewrite output: "%s"',
+                    agent.name,
+                    rewrite.text.replace('"', '\'"\''),
+                )
+                rewritten = self._parse_decision(
+                    rewrite.text,
+                    latency_ms=(result.latency_ms + rewrite.latency_ms),
+                    provider=actual_provider,
+                    model=actual_model,
+                    attempts_used=(result.attempts_used + rewrite.attempts_used),
+                )
+                rewrite_still_bad, _ = self._needs_rewrite(
+                    rewritten,
+                    recent_contents,
+                    recent_speakers,
+                    discussion_mode=discussion_mode,
+                    objective_tier=objective_tier,
+                    is_instigator=is_instigator,
+                )
+                if rewritten.action == "speak" and rewrite_still_bad:
+                    if is_instigator:
+                        dec = rewritten
+                    else:
+                        dec = AgentDecision(
+                            action="pass",
+                            message="pass",
+                            raw_text=rewritten.raw_text,
+                            latency_ms=rewritten.latency_ms,
+                            provider=rewritten.provider,
+                            model=rewritten.model,
+                            attempts_used=rewritten.attempts_used,
+                        )
+                else:
+                    dec = rewritten
+
+                merged_tools = dict(result.tools_used)
+                for tool_name, count in rewrite.tools_used.items():
+                    merged_tools[tool_name] = merged_tools.get(tool_name, 0) + count
+
+                result = CompletionResult(
+                    text=dec.raw_text,
+                    latency_ms=dec.latency_ms,
+                    attempts_used=dec.attempts_used,
+                    tools_used=merged_tools,
+                    tool_results_text="\n".join(
+                        [txt for txt in [result.tool_results_text, rewrite.tool_results_text] if txt]
+                    )
+                    or None,
+                )
+            except Exception as exc:
+                logger.warning("Stance rewrite failed for %s: %s", agent.name, exc)
+
         return AgentDecision(
             action=dec.action,
             message=dec.message,
@@ -142,10 +284,348 @@ class LLMRouter:
             provider=dec.provider,
             model=dec.model,
             attempts_used=dec.attempts_used,
-            reply_to_message_id=dec.reply_to_message_id,
+            quote_message_id=dec.quote_message_id,
             tools_used=result.tools_used,
             tool_results=result.tool_results_text,
         )
+
+    @staticmethod
+    def _word_count(message: str) -> int:
+        return len(re.findall(r"\b\w+\b", message))
+
+    def _is_low_substance_message(self, message: str) -> bool:
+        text = " ".join(message.strip().split())
+        if not text:
+            return True
+
+        lowered = text.lower()
+        word_count = self._word_count(text)
+        if word_count < 12:
+            return True
+
+        if re.match(
+            r"^(i agree|agree|i see .* point|good point|that's fair|you'?re right|i think .* point|that'?s a good point)\b",
+            lowered,
+        ):
+            if not re.search(r"\b(because|my view|i believe|therefore|so)\b", lowered):
+                return True
+
+        question_marks = text.count("?")
+        sentence_marks = len(re.findall(r"[.!?]", text))
+        if question_marks > 0:
+            has_claim_marker = re.search(
+                r"\b(i believe|my view|the answer is|it is|it means|because|therefore|in practice|i conclude)\b",
+                lowered,
+            )
+            mostly_questions = sentence_marks <= question_marks + 1
+            if mostly_questions and not has_claim_marker:
+                return True
+
+        return False
+
+    @staticmethod
+    def _token_set(text: str) -> set[str]:
+        return {token for token in re.findall(r"[a-z0-9']+", text.lower()) if len(token) > 2}
+
+    def _max_similarity_to_recent(self, message: str, recent_contents: Iterable[str]) -> float:
+        base = self._token_set(message)
+        if not base:
+            return 0.0
+        best = 0.0
+        for other in recent_contents:
+            tokens = self._token_set(other)
+            if not tokens:
+                continue
+            union = len(base | tokens)
+            if union == 0:
+                continue
+            score = len(base & tokens) / union
+            if score > best:
+                best = score
+        return best
+
+    @staticmethod
+    def _display_name_roots(agent_names: Iterable[str]) -> list[str]:
+        roots: list[str] = []
+        for name in agent_names:
+            head = name.split("(")[0].strip()
+            if head:
+                roots.append(head.lower())
+        return roots
+
+    def _references_other_agent(self, message: str, agent_names: Iterable[str]) -> bool:
+        lowered = message.lower()
+        for root in self._display_name_roots(agent_names):
+            if root and re.search(rf"\b{re.escape(root)}\b", lowered):
+                return True
+        return False
+
+    def _needs_rewrite(
+        self,
+        decision: AgentDecision,
+        recent_contents: list[str],
+        recent_speakers: list[str],
+        *,
+        discussion_mode: str,
+        objective_tier: str,
+        is_instigator: bool,
+    ) -> tuple[bool, str]:
+        if decision.action != "speak":
+            return False, ""
+
+        min_words, max_words = self._word_bounds_for_mode(discussion_mode, objective_tier)
+        words = self._word_count(decision.message)
+        if words < min_words:
+            return True, f"too short ({words} words)"
+        if words > max_words:
+            return True, f"too long ({words} words)"
+
+        if self._is_low_substance_message(decision.message):
+            return True, "low substance or question/agreement loop"
+
+        if self._is_botty_tone(decision.message):
+            return True, "too formal/robotic tone"
+
+        similarity = self._max_similarity_to_recent(decision.message, recent_contents)
+        if similarity >= self.settings.duplicate_similarity_threshold:
+            return True, f"too similar to recent messages (similarity={similarity:.2f})"
+
+        if discussion_mode != "objective" and self.settings.attack_intensity == "high" and recent_speakers:
+            if not self._references_other_agent(decision.message, recent_speakers):
+                return True, "missing direct engagement with another agent"
+
+        if self.settings.enforce_taunt_profanity and discussion_mode == "adversarial":
+            if recent_speakers and not self._references_other_agent(decision.message, recent_speakers):
+                return True, "missing direct taunt target by name"
+            if not self._has_profanity(decision.message):
+                return True, "missing profanity"
+
+        if discussion_mode == "objective":
+            if self._has_excessive_hostility(decision.message):
+                return True, "tone too hostile for objective mode"
+
+            if is_instigator and self._is_pure_hostile_without_factual_content(decision.message):
+                return True, "instigator must include factual content in objective mode"
+
+            if objective_tier == "simple" and not self._is_correction_message(decision.message):
+                if self._is_redundant_objective_answer(decision.message, recent_contents):
+                    return True, "redundant simple-objective answer"
+
+        if discussion_mode == "exploratory":
+            if self._has_excessive_hostility(decision.message):
+                return True, "too hostile for exploratory mode"
+            if self._is_overly_generic_exploratory(decision.message):
+                return True, "exploratory answer is too generic"
+
+        if discussion_mode == "adversarial" and is_instigator and not self._has_aggressive_tone(decision.message):
+            return True, "instigator tone is too tame"
+
+        return False, ""
+
+    @staticmethod
+    def _is_botty_tone(message: str) -> bool:
+        lowered = message.lower()
+        robotic_markers = (
+            "i strongly disagree",
+            "i firmly believe",
+            "one concrete reason",
+            "furthermore",
+            "in conclusion",
+            "moreover",
+            "i propose we",
+            "i reaffirm",
+            "it is crucial",
+        )
+        if any(marker in lowered for marker in robotic_markers):
+            return True
+
+        # Overly rigid sentence starts often look synthetic in chat.
+        starts = re.findall(r"(?:^|[.!?]\s+)([A-Z][^.!?]{0,80})", message)
+        rigid_count = 0
+        for chunk in starts:
+            c = chunk.strip().lower()
+            if c.startswith(("i believe", "i think", "i disagree", "i agree", "therefore", "however")):
+                rigid_count += 1
+        return rigid_count >= 3
+
+    @staticmethod
+    def _has_aggressive_tone(message: str) -> bool:
+        lowered = message.lower()
+        profanity = {
+            "stfu",
+            "fuck",
+            "fucking",
+            "fuck off",
+            "bullshit",
+            "shit",
+            "dumb",
+            "idiotic",
+            "nonsense",
+        }
+        if any(token in lowered for token in profanity):
+            return True
+
+        attack_markers = (
+            "you are wrong",
+            "that's wrong",
+            "your argument fails",
+            "this is weak",
+            "you're dodging",
+            "stop dodging",
+            "that's lazy reasoning",
+            "that claim collapses",
+        )
+        return any(marker in lowered for marker in attack_markers)
+
+    @staticmethod
+    def _has_profanity(message: str) -> bool:
+        lowered = message.lower()
+        profanity_terms = (
+            "fuck",
+            "fucking",
+            "fuck off",
+            "stfu",
+            "shit",
+            "bullshit",
+            "dumbass",
+            "idiot",
+            "moron",
+            "asshole",
+        )
+        return any(term in lowered for term in profanity_terms)
+
+    @staticmethod
+    def _has_excessive_hostility(message: str) -> bool:
+        lowered = message.lower()
+        hard_hostility = (
+            "fuck off",
+            "stfu",
+            "you are an idiot",
+            "you are dumb",
+            "moron",
+            "asshole",
+        )
+        return any(token in lowered for token in hard_hostility)
+
+    def _is_pure_hostile_without_factual_content(self, message: str) -> bool:
+        lowered = message.lower()
+        has_hostility = self._has_aggressive_tone(message) or self._has_profanity(message)
+        factual_markers = (
+            "because",
+            "for example",
+            "defined as",
+            "evidence",
+            "method",
+            "data",
+            "step",
+            "means",
+            "is",
+        )
+        has_factual = any(marker in lowered for marker in factual_markers)
+        return has_hostility and not has_factual
+
+    def _word_bounds_for_mode(self, discussion_mode: str, objective_tier: str) -> tuple[int, int]:
+        if discussion_mode == "objective":
+            if objective_tier == "simple":
+                return self.settings.objective_simple_min_words, self.settings.objective_simple_max_words
+            return self.settings.objective_min_words, self.settings.objective_max_words
+        if discussion_mode == "exploratory":
+            return self.settings.debatable_min_words, self.settings.debatable_max_words
+        if discussion_mode == "adversarial":
+            return self.settings.adversarial_min_words, self.settings.adversarial_max_words
+        return self.settings.debatable_min_words, self.settings.debatable_max_words
+
+    @staticmethod
+    def _is_overly_generic_exploratory(message: str) -> bool:
+        lowered = message.lower()
+        generic_markers = (
+            "it depends",
+            "hard to say",
+            "complex question",
+            "can't really",
+            "as an ai",
+            "difficult to answer",
+        )
+        if any(marker in lowered for marker in generic_markers):
+            return True
+
+        # Exploratory answers should include some vivid descriptor.
+        vivid_markers = (
+            "like",
+            "feels",
+            "texture",
+            "color",
+            "rhythm",
+            "tone",
+            "edge",
+            "shape",
+        )
+        return not any(marker in lowered for marker in vivid_markers)
+
+    def _is_redundant_objective_answer(self, message: str, recent_contents: list[str]) -> bool:
+        if not recent_contents:
+            return False
+        similarity = self._max_similarity_to_recent(message, recent_contents[-6:])
+        return similarity >= 0.45
+
+    @staticmethod
+    def _is_correction_message(message: str) -> bool:
+        lowered = message.lower()
+        markers = (
+            "wrong",
+            "incorrect",
+            "not true",
+            "that's false",
+            "correction",
+            "actually",
+            "to be precise",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _objective_correction_count(self, recent_contents: list[str]) -> int:
+        return sum(1 for content in recent_contents if self._is_correction_message(content))
+
+    @staticmethod
+    def _extract_discussion_mode(messages: list[dict[str, Any]]) -> str:
+        if not messages:
+            return "debatable"
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        if not user_msgs:
+            return "debatable"
+        content = str(user_msgs[-1].get("content", ""))
+        match = re.search(r"^Discussion Mode:\s*(objective|debatable|adversarial|exploratory)\s*$", content, flags=re.MULTILINE)
+        if match:
+            return match.group(1).strip().lower()
+        return "debatable"
+
+    @staticmethod
+    def _extract_objective_tier(messages: list[dict[str, Any]]) -> str:
+        if not messages:
+            return "none"
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        if not user_msgs:
+            return "none"
+        content = str(user_msgs[-1].get("content", ""))
+        match = re.search(r"^Objective Tier:\s*(simple|explainer|none)\s*$", content, flags=re.MULTILINE)
+        if match:
+            return match.group(1).strip().lower()
+        return "none"
+
+    @staticmethod
+    def _extract_recent_agent_context(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+        if not messages:
+            return [], []
+        user_msgs = [m for m in messages if m.get("role") == "user"]
+        if not user_msgs:
+            return [], []
+        content = str(user_msgs[-1].get("content", ""))
+
+        speakers = re.findall(r"^speaker=(.+)$", content, flags=re.MULTILINE)
+        bodies = re.findall(r"^content=(.+)$", content, flags=re.MULTILINE)
+
+        filtered_speakers = [s.strip() for s in speakers if s.strip() and s.strip().lower() != "unknown"]
+        filtered_bodies = [b.strip() for b in bodies if b.strip()]
+        return filtered_bodies[-12:], filtered_speakers[-12:]
 
     async def summarize(
         self,
@@ -410,12 +890,6 @@ class LLMRouter:
         if not isinstance(message, str):
             return False, "'message' is not a string"
 
-        reply_to = block.get("reply_to_message_id")
-        if reply_to is not None:
-            reply_str = str(reply_to).strip()
-            if not reply_str.isdigit():
-                return False, f"reply_to_message_id is not numeric: {reply_str}"
-
         return True, ""
 
     @staticmethod
@@ -430,11 +904,11 @@ class LLMRouter:
         """Convert a validated JSON block into an AgentDecision."""
         action = str(block.get("action", "speak")).lower().strip()
         message = str(block.get("message", "")).strip()
-        reply_to = block.get("reply_to_message_id")
-        if reply_to is not None:
-            reply_to = str(reply_to).strip()
-            if not reply_to.isdigit():
-                reply_to = None
+        quote_id = block.get("quote_message_id")
+        if quote_id is not None:
+            quote_id = str(quote_id).strip()
+            if not quote_id.isdigit():
+                quote_id = None
 
         if not message:
             message = "I have no additional points."
@@ -447,7 +921,7 @@ class LLMRouter:
             provider=provider,
             model=model,
             attempts_used=attempts_used,
-            reply_to_message_id=reply_to,
+            quote_message_id=quote_id,
         )
 
     @staticmethod
@@ -538,7 +1012,7 @@ class LLMRouter:
                 provider=provider,
                 model=model,
                 attempts_used=attempts_used,
-                reply_to_message_id=primary.reply_to_message_id,
+                quote_message_id=primary.quote_message_id,
                 multi_messages=valid_decisions[1:],
             )
 
@@ -585,9 +1059,9 @@ class LLMRouter:
         if cleaned.startswith("```") and cleaned.endswith("```"):
             cleaned = cleaned.strip("`").strip()
 
-        # Strip leaked JSON fields from message content (reply_to_message_id, action, etc.)
-        cleaned = re.sub(r"reply_to_message_id\s*=?\s*\d+", "", cleaned).strip()
-        cleaned = re.sub(r'"reply_to_message_id"\s*:\s*"\d+"', "", cleaned).strip()
+        # Strip leaked JSON fields from message content (quote_message_id, action, etc.)
+        cleaned = re.sub(r"quote_message_id\s*=?\s*\d+", "", cleaned).strip()
+        cleaned = re.sub(r'"quote_message_id"\s*:\s*"\d+"', "", cleaned).strip()
         cleaned = re.sub(r'"action"\s*:\s*"(speak|pass)"', "", cleaned).strip()
 
         # Hard cap: truncate to 2500 chars to allow thoughtful, detailed responses

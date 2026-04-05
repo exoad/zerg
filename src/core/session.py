@@ -63,10 +63,6 @@ class DebateSession:
     epoch: int = 0
     active: bool = True
 
-    inflight_agent: str | None = None
-    inflight_epoch: int | None = None
-    inflight_task: asyncio.Task[Any] | None = None
-
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -144,19 +140,6 @@ class DebateSession:
                 metadata={"human_role": "steer" if event_type == EventType.HUMAN_STEER else "starter"},
                 increment_turn=False,
             )
-
-    async def set_inflight(self, agent_name: str, task: asyncio.Task[Any]) -> int:
-        async with self.lock:
-            self.inflight_agent = agent_name
-            self.inflight_epoch = self.epoch
-            self.inflight_task = task
-            return self.epoch
-
-    async def clear_inflight(self) -> None:
-        async with self.lock:
-            self.inflight_agent = None
-            self.inflight_epoch = None
-            self.inflight_task = None
 
     async def pop_interrupt(self) -> bool:
         async with self.lock:
