@@ -1,0 +1,29 @@
+[project]
+name = "discord-council-orchestrator"
+version = "0.1.0"
+description = "Discord multi-agent debate orchestration with live human steering"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.10.0,<4.0.0",
+  "cerebras_cloud_sdk>=1.0.0",
+  "discord.py>=2.4.0,<3.0.0",
+  "ddgs>=8.0.0",
+  "litellm>=1.61.0",
+  "python-dotenv>=1.0.1",
+  "PyYAML>=6.0.1"
+]
+
+[project.scripts]
+council-bot = "src.app.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
