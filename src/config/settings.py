@@ -115,7 +115,7 @@ def get_settings() -> Settings:
         consensus_stance_weight=_get_float("CONSENSUS_STANCE_WEIGHT", 0.0),
         consensus_freshness_weight=_get_float("CONSENSUS_FRESHNESS_WEIGHT", 0.0),
         consensus_disagreement_guard_enabled=_get_bool("CONSENSUS_DISAGREEMENT_GUARD_ENABLED", False),
-        agent_response_max_tokens=_get_int("AGENT_RESPONSE_MAX_TOKENS", 512),
+        agent_response_max_tokens=_get_int("AGENT_RESPONSE_MAX_TOKENS", 1500),
         agent_summarize_max_tokens=_get_int("AGENT_SUMMARIZE_MAX_TOKENS", 768),
         agent_response_timeout_sec=_get_int("AGENT_RESPONSE_TIMEOUT_SEC", 35),
         message_delay_seconds=_get_float("MESSAGE_DELAY_SECONDS", 2.0),

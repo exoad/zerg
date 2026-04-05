@@ -585,9 +585,14 @@ class LLMRouter:
         if cleaned.startswith("```") and cleaned.endswith("```"):
             cleaned = cleaned.strip("`").strip()
 
-        # Hard cap: truncate to 400 chars to enforce Discord-style brevity
-        if len(cleaned) > 400:
-            cleaned = cleaned[:397].rstrip() + "..."
+        # Strip leaked JSON fields from message content (reply_to_message_id, action, etc.)
+        cleaned = re.sub(r"reply_to_message_id\s*=?\s*\d+", "", cleaned).strip()
+        cleaned = re.sub(r'"reply_to_message_id"\s*:\s*"\d+"', "", cleaned).strip()
+        cleaned = re.sub(r'"action"\s*:\s*"(speak|pass)"', "", cleaned).strip()
+
+        # Hard cap: truncate to 2500 chars to allow thoughtful, detailed responses
+        if len(cleaned) > 2500:
+            cleaned = cleaned[:2497].rstrip() + "..."
 
         return cleaned
 

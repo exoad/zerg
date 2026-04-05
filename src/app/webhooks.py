@@ -40,6 +40,7 @@ class WebhookManager:
         agent: AgentConfig,
         content: str,
         embed_payloads: list[dict[str, Any]] | None = None,
+        reply_to_message_id: str | None = None,
     ) -> int | None:
         if channel_id != self.allowed_channel_id:
             logger.warning(
@@ -52,6 +53,26 @@ class WebhookManager:
         if not content.strip() and not embed_payloads:
             return None
 
+        clipped = content.strip()
+        if clipped and len(clipped) > 2000:
+            clipped = clipped[:1997] + "..."
+
+        if reply_to_message_id:
+            sent_message_id = await self._send_channel_reply(
+                channel_id=channel_id,
+                agent=agent,
+                content=clipped,
+                embed_payloads=embed_payloads,
+                reply_to_message_id=reply_to_message_id,
+            )
+            if sent_message_id is not None:
+                return sent_message_id
+            logger.warning(
+                "Falling back to webhook send without native reply for %s (reply_to=%s)",
+                agent.name,
+                reply_to_message_id,
+            )
+
         webhook, thread = await self._resolve_webhook(channel_id)
         if webhook is None:
             logger.warning("No webhook available for channel %s", channel_id)
@@ -63,10 +84,7 @@ class WebhookManager:
             "wait": True,
             "allowed_mentions": discord.AllowedMentions.none(),
         }
-        if content.strip():
-            clipped = content.strip()
-            if len(clipped) > 2000:
-                clipped = clipped[:1997] + "..."
+        if clipped:
             kwargs["content"] = clipped
         if embed_payloads:
             kwargs["embeds"] = [self._payload_to_embed(payload) for payload in embed_payloads[:10]]
@@ -106,6 +124,89 @@ class WebhookManager:
         except Exception as exc:
             logger.warning("Unexpected webhook send failure for %s in channel %s: %s", agent.name, channel_id, exc)
             return None
+
+    async def _send_channel_reply(
+        self,
+        *,
+        channel_id: int,
+        agent: AgentConfig,
+        content: str,
+        embed_payloads: list[dict[str, Any]] | None,
+        reply_to_message_id: str,
+    ) -> int | None:
+        target_channel = await self._resolve_message_channel(channel_id)
+        if target_channel is None:
+            logger.warning("Could not resolve channel %s for native reply", channel_id)
+            return None
+
+        message_prefix = f"**{agent.name}**"
+        reply_content = message_prefix
+        if content:
+            reply_content = f"{message_prefix}\n{content}"
+        if len(reply_content) > 2000:
+            reply_content = reply_content[:1997] + "..."
+
+        kwargs: dict[str, Any] = {
+            "allowed_mentions": discord.AllowedMentions.none(),
+            "mention_author": False,
+            "content": reply_content,
+        }
+        if embed_payloads:
+            kwargs["embeds"] = [self._payload_to_embed(payload) for payload in embed_payloads[:10]]
+
+        try:
+            reply_id = int(reply_to_message_id)
+        except ValueError:
+            logger.warning("Invalid reply_to_message_id for %s: %s", agent.name, reply_to_message_id)
+        else:
+            kwargs["reference"] = target_channel.get_partial_message(reply_id)
+
+        try:
+            for attempt in range(2):
+                try:
+                    message = await target_channel.send(**kwargs)
+                    logger.info(
+                        "Delivered native reply for %s to channel %s (message_id=%s, reply_to=%s)",
+                        agent.name,
+                        channel_id,
+                        message.id,
+                        reply_to_message_id,
+                    )
+                    return message.id
+                except discord.HTTPException as exc:
+                    status = getattr(exc, "status", None)
+                    can_retry = attempt == 0 and status in {429, 500, 502, 503, 504}
+                    if can_retry:
+                        logger.warning(
+                            "Native reply transient failure for %s (status=%s). Retrying once.",
+                            agent.name,
+                            status,
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+                    logger.warning(
+                        "Failed native reply for %s in channel %s (status=%s): %s",
+                        agent.name,
+                        channel_id,
+                        status,
+                        exc,
+                    )
+                    return None
+        except Exception as exc:
+            logger.warning("Unexpected native reply failure for %s in channel %s: %s", agent.name, channel_id, exc)
+            return None
+
+    async def _resolve_message_channel(self, channel_id: int) -> discord.TextChannel | discord.Thread | None:
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                return None
+
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            return channel
+        return None
 
     async def _resolve_webhook(self, channel_id: int) -> tuple[discord.Webhook | None, discord.Thread | None]:
         if self.default_webhook_url:

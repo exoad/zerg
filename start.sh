@@ -3,11 +3,55 @@ set -euo pipefail
 
 # Bootstrap the Discord Council Orchestrator project.
 # This script creates a Python virtual environment, installs build tools,
-# and installs the project in editable mode.
+# installs the project in editable mode, starts Docker sandboxing via Colima,
+# and runs the bot. On exit, it tears down all Docker resources.
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT_DIR"
 
+# --- Docker sandbox lifecycle ---
+DOCKER_STARTED_BY_SCRIPT=false
+
+cleanup_docker() {
+  echo ""
+  echo "Shutting down Docker sandbox..."
+
+  # Kill any running containers spawned by the sandbox tools
+  if [ "$DOCKER_STARTED_BY_SCRIPT" = true ]; then
+    docker ps -q --filter "ancestor=python:3.11-alpine" --filter "ancestor=node:20-alpine" 2>/dev/null \
+      | xargs -r docker stop 2>/dev/null || true
+    docker ps -aq --filter "ancestor=python:3.11-alpine" --filter "ancestor=node:20-alpine" 2>/dev/null \
+      | xargs -r docker rm -f 2>/dev/null || true
+
+    # Stop the Colima VM
+    echo "Stopping Colima VM..."
+    colima stop 2>/dev/null || true
+  fi
+
+  echo "Docker sandbox cleaned up."
+}
+
+trap cleanup_docker EXIT
+
+echo "Checking Docker sandbox (Colima)..."
+if command -v colima >/dev/null 2>&1 && command -v docker >/dev/null 2>&1; then
+  if ! colima status >/dev/null 2>&1; then
+    echo "Starting Colima VM for sandboxed code execution..."
+    colima start --cpu 2 --memory 2 --disk 10 2>&1 | grep -v "^\[" || true
+    DOCKER_STARTED_BY_SCRIPT=true
+    echo "Docker sandbox ready."
+  else
+    echo "Colima is already running. Using existing instance."
+  fi
+
+  # Pre-pull sandbox images if missing
+  docker image inspect python:3.11-alpine >/dev/null 2>&1 || docker pull python:3.11-alpine >/dev/null 2>&1 || true
+  docker image inspect node:20-alpine >/dev/null 2>&1 || docker pull node:20-alpine >/dev/null 2>&1 || true
+else
+  echo "WARNING: Colima or Docker not found. Sandboxed code execution tools will be disabled."
+fi
+
+# --- Python bootstrap ---
 PYTHON=""
 if command -v python3 >/dev/null 2>&1; then
   PYTHON=python3

@@ -39,6 +39,8 @@ class DebateSnapshot:
     session_id: str
     channel_id: int
     starter_user_id: int
+    starter_display_name: str
+    topic: str
     events: tuple[DebateEvent, ...]
     turn_index: int
     epoch: int
@@ -51,6 +53,8 @@ class DebateSession:
     session_id: str
     channel_id: int
     starter_user_id: int
+    starter_display_name: str
+    topic: str
     max_turns: int
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -99,6 +103,9 @@ class DebateSession:
         async with self.lock:
             if self.events:
                 raise ValueError("Session already started")
+
+            if not self.topic.strip():
+                self.topic = opener_text.strip()
 
             self._append_event(
                 event_type=EventType.SESSION_STARTED,
@@ -242,6 +249,8 @@ class DebateSession:
                 session_id=self.session_id,
                 channel_id=self.channel_id,
                 starter_user_id=self.starter_user_id,
+                starter_display_name=self.starter_display_name,
+                topic=self.topic,
                 events=tuple(self.events),
                 turn_index=self.turn_index,
                 epoch=self.epoch,

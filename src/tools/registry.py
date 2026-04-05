@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import uuid
 import warnings
@@ -25,7 +26,19 @@ _DOCKER_AVAILABLE: bool | None = None
 def _is_docker_available() -> bool:
     global _DOCKER_AVAILABLE
     if _DOCKER_AVAILABLE is None:
-        _DOCKER_AVAILABLE = shutil.which("docker") is not None
+        if shutil.which("docker") is None:
+            _DOCKER_AVAILABLE = False
+        else:
+            try:
+                result = subprocess.run(
+                    ["docker", "info", "--format", "{{.ServerVersion}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                _DOCKER_AVAILABLE = result.returncode == 0
+            except Exception:
+                _DOCKER_AVAILABLE = False
     return _DOCKER_AVAILABLE
 
 async def web_search(query: str) -> str:

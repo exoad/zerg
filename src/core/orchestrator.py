@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -21,7 +20,7 @@ from src.llm.router import AgentDecision, LLMRouter
 logger = logging.getLogger(__name__)
 
 EmbedPayload = dict[str, Any]
-EmitAgentMessage = Callable[[int, AgentConfig, str, list[EmbedPayload] | None], Awaitable[int | None]]
+EmitAgentMessage = Callable[[int, AgentConfig, str, list[EmbedPayload] | None, str | None], Awaitable[int | None]]
 
 
 @dataclass
@@ -144,6 +143,8 @@ class CouncilOrchestrator:
                 session_id=str(uuid.uuid4()),
                 channel_id=channel_id,
                 starter_user_id=starter_user_id,
+                starter_display_name=starter_name,
+                topic=topic.strip(),
                 max_turns=max_turns if max_turns is not None else self.settings.council_max_turns,
             )
             await session.start(starter_name, topic)
@@ -366,35 +367,10 @@ class CouncilOrchestrator:
                         )
                         if target_event:
                             target_name = target_event.actor_name or "Unknown"
-                            short_name = target_name.split(" (")[0]
                             sub_reply_meta["reply_to_actor_name"] = target_name
                             sub_reply_meta["reply_to_event_id"] = target_event.event_id
                             sub_reply_meta["reply_target_found"] = True
-
-                            try:
-                                # Sanitize quoted content: strip reply headers, debug info, nested quotes.
-                                clean_content = target_event.content
-                                clean_content = re.sub(r"^\*\*↩️ .+\*\*\n?", "", clean_content, flags=re.MULTILINE)
-                                clean_content = re.sub(r"^Reply to .+ message_id=\d+\n?", "", clean_content, flags=re.MULTILINE)
-                                clean_content = re.sub(r"^> .+\n", "", clean_content, flags=re.MULTILINE)
-                                clean_content = clean_content.strip()
-                                short_content = clean_content[:100].replace("\n", " ") + (
-                                    "..." if len(clean_content) > 100 else ""
-                                )
-                                if short_content:
-                                    sub_message = (
-                                        f"**↩️ {short_name}**\n"
-                                        f"> {short_content}\n\n"
-                                        f"{sub_message}"
-                                    )
-                            except Exception as exc:
-                                logger.warning(
-                                    "Reply decoration failed for %s -> %s: %s",
-                                    agent.name,
-                                    sub_decision.reply_to_message_id,
-                                    exc,
-                                )
-                        # If target not found, silently skip reply decoration
+                        # If target not found, keep the reply id metadata for downstream delivery.
 
                     sub_meta = self._decision_metadata(
                         sub_decision,
@@ -414,7 +390,13 @@ class CouncilOrchestrator:
                     else:
                         # Only attach tool embed to the first message
                         embeds = tool_embed if i == 0 else None
-                        msg_id = await self._emit_agent(channel_id, agent, sub_message, embed_payloads=embeds)
+                        msg_id = await self._emit_agent(
+                            channel_id,
+                            agent,
+                            sub_message,
+                            embed_payloads=embeds,
+                            reply_to_message_id=sub_decision.reply_to_message_id,
+                        )
                         if msg_id:
                             sub_meta["discord_message_id"] = msg_id
                             last_msg_id = msg_id
@@ -538,6 +520,7 @@ class CouncilOrchestrator:
         content: str,
         *,
         embed_payloads: list[EmbedPayload] | None = None,
+        reply_to_message_id: str | None = None,
     ) -> int | None:
         if self._emit is None:
             return None
@@ -550,7 +533,7 @@ class CouncilOrchestrator:
         if clipped and len(clipped) > 2000:
             clipped = clipped[:1997] + "..."
 
-        return await self._emit(channel_id, agent, clipped, embed_payloads)
+        return await self._emit(channel_id, agent, clipped, embed_payloads, reply_to_message_id)
 
     async def _refresh_model_assignments_if_needed(self, runtime: SessionRuntime, epoch: int) -> None:
         if runtime.assignment_epoch == epoch and runtime.model_assignments:
