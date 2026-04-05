@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
-import os
 import shutil
 import subprocess
-import tempfile
 import uuid
 import warnings
 from typing import Any
@@ -73,90 +72,97 @@ async def web_search(query: str) -> str:
         return f"WEB_SEARCH_ERROR: {exc}"
 
 
-async def execute_python(code: str) -> str:
-    """Execute Python code in an isolated Docker container with a short timeout."""
+async def _run_sandboxed(image: str, shell_cmd: str, code: str) -> str:
+    """Run code in a Docker container by passing the source via an env var.
+
+    The code is base64-encoded and passed as the CODE environment variable.
+    The container decodes and executes it. This avoids volume-mount path
+    issues on macOS/Colima and works with --read-only rootfs.
+    """
     if not _is_docker_available():
-        return "Docker is not available on this system. The execute_python tool requires Docker to be installed and running."
+        return "Docker is not available on this system. Sandboxed code execution requires Docker to be installed and running."
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        script_path = os.path.join(temp_dir, "script.py")
-        with open(script_path, "w") as f:
-            f.write(code)
+    container_id = None
+    try:
+        encoded = base64.b64encode(code.encode("utf-8")).decode("ascii")
+        container_name = f"sandbox-{uuid.uuid4().hex[:12]}"
 
+        create_cmd = (
+            f"docker create --name {container_name} "
+            "--network none "
+            "--memory 128m --cpus 0.5 --pids-limit 50 "
+            "--read-only "
+            "--cap-drop ALL "
+            "--no-healthcheck "
+            f"-e CODE='{encoded}' "
+            f"{image} "
+            f"sh -c 'echo \"$CODE\" | base64 -d | {shell_cmd}'"
+        )
+        create_proc = await asyncio.create_subprocess_shell(
+            create_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        create_stdout, create_stderr = await asyncio.wait_for(create_proc.communicate(), timeout=10.0)
+        if create_proc.returncode != 0:
+            return f"Sandbox container creation failed: {create_stderr.decode().strip()}"
+
+        container_id = create_stdout.decode().strip()
+
+        start_cmd = f"docker start -a {container_name}"
+        start_proc = await asyncio.create_subprocess_shell(
+            start_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            cmd = (
-                f"docker run --rm --network none -v {temp_dir}:/app -w /app "
-                "python:3.11-alpine python script.py"
-            )
-            
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                return "Execution timed out after 10 seconds."
-            
-            output = ""
-            if stdout:
-                output += "STDOUT:\n" + stdout.decode().strip() + "\n"
-            if stderr:
-                output += "STDERR:\n" + stderr.decode().strip() + "\n"
-            
-            if not output:
-                output = "Code executed successfully without producing output."
-                
-            return output.strip()[:1000]
+            stdout, stderr = await asyncio.wait_for(start_proc.communicate(), timeout=10.0)
+        except asyncio.TimeoutError:
+            start_proc.kill()
+            return "Execution timed out after 10 seconds."
 
-        except Exception as exc:
-            return f"Failed to execute sandboxed python code: {exc}"
+        output = ""
+        if stdout:
+            output += "STDOUT:\n" + stdout.decode().strip() + "\n"
+        if stderr:
+            output += "STDERR:\n" + stderr.decode().strip() + "\n"
+
+        if not output:
+            output = "Code executed successfully without producing output."
+
+        return output.strip()[:1000]
+
+    except Exception as exc:
+        return f"Failed to execute sandboxed code: {exc}"
+    finally:
+        if container_id:
+            try:
+                rm_proc = await asyncio.create_subprocess_shell(
+                    f"docker rm -f {container_id}",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(rm_proc.communicate(), timeout=5.0)
+            except Exception:
+                pass
+
+
+async def execute_python(code: str) -> str:
+    """Execute Python code in an isolated Docker container with strict resource limits."""
+    return await _run_sandboxed(
+        image="python:3.11-alpine",
+        shell_cmd="python",
+        code=code,
+    )
 
 
 async def execute_javascript(code: str) -> str:
-    """Execute Javascript code in an isolated Docker Node container."""
-    if not _is_docker_available():
-        return "Docker is not available on this system. The execute_javascript tool requires Docker to be installed and running."
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        script_path = os.path.join(temp_dir, "script.js")
-        with open(script_path, "w") as f:
-            f.write(code)
-
-        try:
-            cmd = (
-                f"docker run --rm --network none -v {temp_dir}:/app -w /app "
-                "node:20-alpine node script.js"
-            )
-            
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                return "Execution timed out after 10 seconds."
-            
-            output = ""
-            if stdout:
-                output += "STDOUT:\n" + stdout.decode().strip() + "\n"
-            if stderr:
-                output += "STDERR:\n" + stderr.decode().strip() + "\n"
-            
-            if not output:
-                output = "Code executed successfully without producing output."
-                
-            return output.strip()[:1000]
-
-        except Exception as exc:
-            return f"Failed to execute sandboxed JS code: {exc}"
+    """Execute JavaScript code in an isolated Docker container with strict resource limits."""
+    return await _run_sandboxed(
+        image="node:20-alpine",
+        shell_cmd="node",
+        code=code,
+    )
 
 
 def get_tool_schema() -> list[dict[str, Any]]:

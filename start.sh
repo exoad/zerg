@@ -18,10 +18,14 @@ cleanup_docker() {
 
   # Kill any running containers spawned by the sandbox tools
   if [ "$DOCKER_STARTED_BY_SCRIPT" = true ]; then
-    docker ps -q --filter "ancestor=python:3.11-alpine" --filter "ancestor=node:20-alpine" 2>/dev/null \
-      | xargs -r docker stop 2>/dev/null || true
-    docker ps -aq --filter "ancestor=python:3.11-alpine" --filter "ancestor=node:20-alpine" 2>/dev/null \
-      | xargs -r docker rm -f 2>/dev/null || true
+    running=$(docker ps -q --filter "ancestor=python:3.11-alpine" --filter "ancestor=node:20-alpine" 2>/dev/null || true)
+    if [ -n "$running" ]; then
+      docker stop $running 2>/dev/null || true
+    fi
+    all_containers=$(docker ps -aq --filter "ancestor=python:3.11-alpine" --filter "ancestor=node:20-alpine" 2>/dev/null || true)
+    if [ -n "$all_containers" ]; then
+      docker rm -f $all_containers 2>/dev/null || true
+    fi
 
     # Stop the Colima VM
     echo "Stopping Colima VM..."

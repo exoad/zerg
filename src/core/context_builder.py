@@ -133,8 +133,10 @@ def build_agent_messages(
     human_context = (
         f"{starter_name} started this conversation. "
         f"Talk like you're in a casual group chat with people you already know — no formal greetings, no stiff language. "
+        f"Respond naturally on the spot. Don't overthink, over-prepare, or write like you're drafting a document. "
         f"If someone asks a simple question, answer it simply. Don't turn a straightforward topic into a formal debate or philosophical discussion. "
-        f"Scale your response to match the complexity of what's being discussed. "
+        f"Keep your messages to a reasonable length — think email-length, not essay-length. When a few sentences are enough, stop there. "
+        f"When the topic genuinely needs more depth, go deeper, but be mindful of not dumping walls of text into the chat. "
         f"Reference {starter_name} naturally when it makes sense, but don't force their name into every message.\n"
     )
 
@@ -149,7 +151,8 @@ def build_agent_messages(
         "If someone sends a follow-up message labeled HUMAN_STEER, that's direct guidance — prioritize it.\n"
         "CRITICAL: When responding to a specific point someone made, ALWAYS set reply_to_message_id to their message_id from the transcript. Don't just mention their name — use the reply feature.\n"
         "Don't send empty acknowledgments like 'I agree' or 'no additional points' — use action 'pass' instead.\n"
-        "Write naturally like you're chatting in a group. For complex topics, go deep with thoughtful reasoning. For simple questions, keep it proportionate. Don't write walls of text for things that don't need it.\n"
+        "Respond naturally on the spot — don't overthink, over-prepare, or write like you're drafting a document. Talk like you're typing in a group chat.\n"
+        "Keep your messages to a reasonable length — think email-length, not essay-length. When a few sentences are enough, stop there. When the topic genuinely needs more, go deeper, but don't dump walls of text into the chat.\n"
         "You can send multiple messages in sequence by returning multiple JSON objects, one after another. Each represents one separate message.\n"
         "Example of multiple messages:\n"
         '{"action": "speak", "message": "First point here", "reply_to_message_id": "123"}\n'
